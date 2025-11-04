@@ -1,212 +1,162 @@
-# Catalog parameters
-catalog_tables = ""
-# catalog_tables="[{\"schema_name\":\"DWH\",\"table_name\":\"TB_FactInspectionSignature\",\"is_incremental_load\":true,\"last_modified_column\":\"ETL_DTM_CreatedAt\",\"start_date\":\"2024-01-01T00:00:00+00:00\",\"primary_keys_list\":\"NUM_ProjectKey;NUM_InspectionKey;NUM_InspectionRev;TXT_InspectionRole\",\"partition_keys_list\":\"NUM_ProjectKey\"},{\"schema_name\":\"CertifiedProgress\",\"table_name\":\"Agg ScopeOfWork\",\"is_incremental_load\":false,\"last_modified_column\":null,\"start_date\":null,\"primary_keys_list\":null,\"partition_keys_list\":null}]"
+%%configure -f
+{
+    "conf":
+    {
+        //# Compatibility with datetime < 1900-01-01
+        "spark.sql.legacy.parquet.datetimeRebaseModeInRead": "CORRECTED",
+        "spark.sql.legacy.parquet.int96RebaseModeInRead": "CORRECTED",
+        "spark.sql.parquet.int96RebaseModeInWrite": "CORRECTED",
+        "spark.sql.parquet.datetimeRebaseModeInWrite": "CORRECTED",
+        //# Compatibility with decimal columns in parquet
+        "spark.sql.parquet.enableVectorizedReader": "false",
+        //# Enables time travel up to 90 days in the past and prevent VACUUM from deleting files in this period
+        "spark.databricks.delta.properties.defaults.logRetentionDuration": "interval 90 days",
+        "spark.databricks.delta.properaties.defaults.deletedFileRetentionDuration": "interval 90 days",
+        //# Optimize write feature (better read performance, slightly worse write performance)
+        "spark.microsoft.delta.optimizeWrite.enabled": "true",
+        "spark.sql.sources.partitionOverwriteMode": "DYNAMIC",
+        "spark.databricks.delta.schema.autoMerge.enabled": "true"
+    }
+}
+import pyspark.sql.functions as F
+from pyspark.sql.window import Window
+from pyspark.sql.types import StringType
+import ast
+from delta.tables import *
 
 # Source parameters
-server = ""
-source_database_name = ""
-source_link_name = ""
-#server="azswne08wedevsynapse01.sql.azuresynapse.net"
-#source_database_name="AZSQLPNE08WEDEV"
-#source_link_name="SQLPoolConstruction"
+source_path = ""
+source_zone = ""
+source_tables = ""
+#source_path="RAW/DATASOURCE=EPV2_BI/"
+#source_zone="azblb01raw@azsane08wedevraw01"
+#source_tables = "[{\"schema_name\":\"DWH\",\"table_name\":\"TB_FactCertification\",\"is_incremental_load\":true,\"last_modified_column\":\"ETL_DTM_CreatedAt\",\"start_date\":\"2024-01-01T00:00:00+00:00\",\"primary_keys_list\":\"NUM_ProjectKey;NUM_CertificationKey\",\"partition_keys_list\":\"NUM_ProjectKey;NUM_CutOffKey\"}]"
+
 
 # Destination parameters
+destination_database = ""
 destination_path = ""
 destination_zone = ""
-#destination_path="RAW/DATASOURCE=EPV2_BI/"
-#destination_zone="azblb01raw@azsane08wedevraw01"
-
-# Notebook
-child_notebook_path=""
-time_out= ""
-thread_pool_executor= ""
-retry_number= ""
-#child_notebook_path="COMMON/NTBK_COMMON_CHILD_INCREMENTAL_SQLDW_TO_SPOT"
-#time_out=600
-#thread_pool_executor=2
-#retry_number=1
-def raw_to_cleansed(
-    server,
-    source_database_name, 
-    destination_path,  
-    destination_zone,
-    schema_name, 
-    table_name, 
-    is_incremental_load, 
-    last_modified_column, 
-    start_date, 
-    child_notebook_path, 
-    time_out, 
-    retry_number,
-    source_link_name):
-    print(f"server={server}")
-    print(f"source_database_name={source_database_name}")
-    print(f"destination_path={destination_path}")
-    print(f"destination_zone={destination_zone}")
-    print(f"schema_name={schema_name}")
-    print(f"table_name={table_name}")
-    print(f"is_incremental_load={is_incremental_load}")
-    print(f"last_modified_column={last_modified_column}")
-    print(f"start_date={start_date}")
-    print(f"child_notebook_path={child_notebook_path}")
-    print(f"time_out={time_out}")
-    print(f"retry_number={retry_number}")
-    print(f"source_link_name={source_link_name}")
-
-    retryNumber = 0
-    finished = False
-    folder=f"{schema_name}.{table_name}"
-    while retryNumber < retry_number and not finished:
-        try:
-            success, error = make_tuple(
-                mssparkutils.notebook.run(
-                    child_notebook_path,
-                    time_out,
-                    arguments = {
-                        "server": server,
-                        "source_database_name": source_database_name,
-                        "destination_path": destination_path,
-                        "destination_zone": destination_zone,
-                        "schema_name": schema_name,
-                        "table_name": table_name,
-                        "is_incremental_load": is_incremental_load,
-                        "last_modified_column": last_modified_column,
-                        "start_date": start_date,
-                        "source_link_name" : source_link_name
-                    }
-                )
-            )
-            if (success):
-                print(f"LOAD {folder} TABLE FINISHED", flush=True)
-            else:
-                print(f"LOAD {folder} TABLE FAILED WITH \"{error}\"", flush=True)
-            result = (folder, error)
-            finished = True
-        except Exception as error:
-            print(f"LOAD {folder} TABLE FAILED WITH \"{error}\"", flush=True)
-            result = (folder, error)
-            retryNumber+=1
-            time.sleep(30)
-    return result
-
-
-def read_from_sql(server, database, schema, table, token, incremental=False, last_modified=None, last_partition=None, start_date=None):
-    """Read table data from SQL Database using jdbc connection
+#destination_database="spot_epv2_bi"
+#destination_path="CLEANSED/DATASOURCE=EPV2_BI/"
+#destination_zone="azblb01cleansed@azsane08wedevcleansed01"
+def convert_string_to_dict(encoded_string):
+    """convert string encoded to dict
 
     Args:
-        server (String): the name of th server
-        database (String): the name of database
-        schema (String): the name of the schema
-        table (String): the name of the table
-        token (String): the generated token using linked service
-        incremental (Boolean): is the table is incremental load
-        last_modified (String): The name of the column for the watermark
-        last_partition (String): The latest partition date
-        start_date (String): The start date for the init
-        
+        encoded_string (String): the string encodede
+   
     Returns:
-        dataframe: the table data load into a dataframe
+        Dict: return the encoded string to dict format
     """
+    formated_string=encoded_string.replace("true","True")
+    formated_string=formated_string.replace("false","False")
+    formated_string=formated_string.replace("null","None")
+    formated_string=ast.literal_eval(formated_string)
+    return formated_string
 
-    jdbcUrl = f"jdbc:sqlserver://{server}:1433;databaseName={database};encrypt=true;trustServerCertificate=false;hostNameInCertificate=*.database.windows.net;loginTimeout=30"
-    connectionProperties = {
-        "driver" : "com.microsoft.sqlserver.jdbc.SQLServerDriver",
-        "accessToken" : token
-    }
 
-    print(f"incremental={incremental}")
-    print(f"last_partition={last_partition}")
-    print(f"start_date={start_date}")
+def get_latest_partition(zone, path, folder):
+    """Get the latest partition of the table
+ 
+    Args:
+        zone (String): the destination zone
+        path (String): the path of the destination
+        folder (String): the name of the folder
+        incremental (Boolean): Is the table load in incremental
+   
+    Returns:
+        String: the latest partition_date if exists, None otherwise
+    """
+    try:
+        df=spark.read.load(f"abfss://{zone}.dfs.core.windows.net/{path}{folder}/", format='delta')
+        last_update=df.select(F.max("partition_date").alias("last_update")).first()[0]
+        return last_update
+    except:
+        return None
 
-    if(incremental==True):
-        if(last_partition != None):
-            if(start_date != None):
-                pushdown_query = f"(SELECT * FROM [{schema}].[{table}] where ({last_modified} >= '{last_partition}') and ({last_modified} >= '{start_date}')) as tb1"
-            else:
-                pushdown_query = f"(SELECT * FROM [{schema}].[{table}] where {last_modified} >= '{last_partition}') as tb1"
-        else:
-            if(start_date != None):
-                pushdown_query = f"(SELECT * FROM [{schema}].[{table}] where {last_modified} >= '{start_date}') as tb1"
-            else:
-                pushdown_query= f"(SELECT * FROM [{schema}].[{table}]) as tb1"
-    else:
-        pushdown_query= f"(SELECT * FROM [{schema}].[{table}]) as tb1"
+
+def generate_merge_condition(pk_cols):
+    """Generate the merge condition
+ 
+    Args:
+        pk_cols (list): list of the columns generating the PK
+   
+    Returns:
+        String: the condition query for the merge
+    """
+    condition = f"source.{pk_cols[0]} = destination.{pk_cols[0]}"
+
+    for col in pk_cols[1:]: 
+        condition += f" AND source.{col} = destination.{col}"
     
-    print(pushdown_query)
-    df = spark.read \
-    .option("fetchsize", 10000) \
-    .option("numPartitions", 5) \
-    .jdbc(url=jdbcUrl, table=pushdown_query, properties=connectionProperties)
-    return df
-
-
-def convert_string_to_json(json_string_formatted):
-    formatted_string=json_string_formatted.replace("true","True")
-    formatted_string=formatted_string.replace("false","False")
-    formatted_string=formatted_string.replace("null","None")
-    formatted_string=ast.literal_eval(formatted_string)
-    return formatted_string
-
+    print(f"condition={condition}")
+    return condition
 # Get list tables from catalog
-catalog_tables=convert_string_to_json(catalog_tables)
-print(catalog_tables)
+source_tables=convert_string_to_dict(source_tables)
 
-# Create an empty list
-servers=[]
-source_database_names=[]
-destination_paths=[]
-destination_zones=[]
-schema_names = []
-table_names = []
-is_incremental_loads = []
-last_modified_columns = []
-start_dates = []
-child_notebook_paths = []
-time_outs = []
-retry_numbers = []
-source_link_names = []
+# Create spot DB
+spark.sql(f"CREATE DATABASE IF NOT EXISTS {destination_database}")
 
-# create list of parameters
-for row in catalog_tables:
-    servers.append(server)
-    source_database_names.append(source_database_name)
-    destination_paths.append(destination_path)
-    destination_zones.append(destination_zone)
-    schema_names.append(row["schema_name"])
-    table_names.append(row["table_name"])
-    is_incremental_loads.append(row["is_incremental_load"])
-    last_modified_columns.append(row["last_modified_column"])
-    start_dates.append(row["start_date"])
-    child_notebook_paths.append(child_notebook_path)
-    time_outs.append(time_out)
-    retry_numbers.append(retry_number)
-    source_link_names.append(source_link_name)
+# For each tables
+for row in source_tables:
+    print(f"{row['schema_name']}.{row['table_name']}")
+    folder=f"{row['schema_name']}.{row['table_name']}"
+    partition_keys=row['partition_keys_list'].split(";")
+    primary_keys=row['primary_keys_list'].split(";")
 
-print(f"table_names={table_names}")
+    # get the latest partition on cleansed
+    latest_partition=get_latest_partition(destination_zone, destination_path, folder)
+    print(f"==>latest_partition={latest_partition}")
 
-with ThreadPoolExecutor(thread_pool_executor) as executor:
-    results = list(
-        executor.map(
-            raw_to_cleansed,
-            servers,
-            source_database_names,
-            destination_paths, 
-            destination_zones,
-            schema_names,
-            table_names,
-            is_incremental_loads,
-            last_modified_columns,
-            start_dates,
-            child_notebook_paths,
-            time_outs,
-            retry_numbers,
-            source_link_names
+    # read by merging the schema
+    try:
+        df = (
+            spark
+            .read
+            .option("mergeSchema", "true")
+            .load(f'abfss://{source_zone}.dfs.core.windows.net/{source_path}{folder}', format='parquet')
         )
-    )
-    print(f"results={results}")
 
-mssparkutils.notebook.exit(json.dumps({
-    'success': [table for table, error in results if error is None],
-    'failure': [table for table, error in results if error is not None],
-    'errors': {table: str(error) for table, error in results if error is not None}
-}))
+        if(latest_partition != None):
+            df = df.filter(F.col("partition_date")>=latest_partition)
+    except:
+        print(f'the folder abfss://{source_zone}.dfs.core.windows.net/{source_path}{folder} doesnt exist')
+        continue
+    
+    # keep the latest records
+    df = (
+        df
+        .withColumn("row_number",
+        F.row_number().over(Window.partitionBy(*primary_keys).orderBy(F.col("partition_date").desc(),F.col(f"{row['last_modified_column']}").desc())))
+        .filter(F.col("row_number")==1)
+        .drop("row_number")
+    )
+
+    # convert partition_date to string
+    df = df.withColumn("partition_date", F.col("partition_date").cast(StringType()))
+
+    if (df.count()!=0):
+        try:
+            df_delta = DeltaTable.forPath(spark, f"abfss://{destination_zone}.dfs.core.windows.net/{destination_path}{folder}/")
+            (
+                df_delta
+                .alias('destination')
+                .merge(df.alias('source'), generate_merge_condition(primary_keys))
+                .whenMatchedUpdateAll()
+                .whenNotMatchedInsertAll()
+                .execute()
+            )
+        except:
+            (
+            df
+            .write
+            .option("mergeSchema", "true")
+            .format("delta")
+            .mode("overwrite")
+            .partitionBy("partition_date", *partition_keys)
+            .save(f"abfss://{destination_zone}.dfs.core.windows.net/{destination_path}{folder}/")
+            )
+
+    spark.sql(f"DROP TABLE IF EXISTS {destination_database}.{row['schema_name']}_{row['table_name']}")
+    spark.sql(f"CREATE TABLE IF NOT EXISTS {destination_database}.{row['schema_name']}_{row['table_name']} USING DELTA LOCATION 'abfss://{destination_zone}.dfs.core.windows.net/{destination_path}{folder}'")
