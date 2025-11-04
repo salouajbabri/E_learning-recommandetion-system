@@ -1,0 +1,212 @@
+# Catalog parameters
+catalog_tables = ""
+# catalog_tables="[{\"schema_name\":\"DWH\",\"table_name\":\"TB_FactInspectionSignature\",\"is_incremental_load\":true,\"last_modified_column\":\"ETL_DTM_CreatedAt\",\"start_date\":\"2024-01-01T00:00:00+00:00\",\"primary_keys_list\":\"NUM_ProjectKey;NUM_InspectionKey;NUM_InspectionRev;TXT_InspectionRole\",\"partition_keys_list\":\"NUM_ProjectKey\"},{\"schema_name\":\"CertifiedProgress\",\"table_name\":\"Agg ScopeOfWork\",\"is_incremental_load\":false,\"last_modified_column\":null,\"start_date\":null,\"primary_keys_list\":null,\"partition_keys_list\":null}]"
+
+# Source parameters
+server = ""
+source_database_name = ""
+source_link_name = ""
+#server="azswne08wedevsynapse01.sql.azuresynapse.net"
+#source_database_name="AZSQLPNE08WEDEV"
+#source_link_name="SQLPoolConstruction"
+
+# Destination parameters
+destination_path = ""
+destination_zone = ""
+#destination_path="RAW/DATASOURCE=EPV2_BI/"
+#destination_zone="azblb01raw@azsane08wedevraw01"
+
+# Notebook
+child_notebook_path=""
+time_out= ""
+thread_pool_executor= ""
+retry_number= ""
+#child_notebook_path="COMMON/NTBK_COMMON_CHILD_INCREMENTAL_SQLDW_TO_SPOT"
+#time_out=600
+#thread_pool_executor=2
+#retry_number=1
+def raw_to_cleansed(
+    server,
+    source_database_name, 
+    destination_path,  
+    destination_zone,
+    schema_name, 
+    table_name, 
+    is_incremental_load, 
+    last_modified_column, 
+    start_date, 
+    child_notebook_path, 
+    time_out, 
+    retry_number,
+    source_link_name):
+    print(f"server={server}")
+    print(f"source_database_name={source_database_name}")
+    print(f"destination_path={destination_path}")
+    print(f"destination_zone={destination_zone}")
+    print(f"schema_name={schema_name}")
+    print(f"table_name={table_name}")
+    print(f"is_incremental_load={is_incremental_load}")
+    print(f"last_modified_column={last_modified_column}")
+    print(f"start_date={start_date}")
+    print(f"child_notebook_path={child_notebook_path}")
+    print(f"time_out={time_out}")
+    print(f"retry_number={retry_number}")
+    print(f"source_link_name={source_link_name}")
+
+    retryNumber = 0
+    finished = False
+    folder=f"{schema_name}.{table_name}"
+    while retryNumber < retry_number and not finished:
+        try:
+            success, error = make_tuple(
+                mssparkutils.notebook.run(
+                    child_notebook_path,
+                    time_out,
+                    arguments = {
+                        "server": server,
+                        "source_database_name": source_database_name,
+                        "destination_path": destination_path,
+                        "destination_zone": destination_zone,
+                        "schema_name": schema_name,
+                        "table_name": table_name,
+                        "is_incremental_load": is_incremental_load,
+                        "last_modified_column": last_modified_column,
+                        "start_date": start_date,
+                        "source_link_name" : source_link_name
+                    }
+                )
+            )
+            if (success):
+                print(f"LOAD {folder} TABLE FINISHED", flush=True)
+            else:
+                print(f"LOAD {folder} TABLE FAILED WITH \"{error}\"", flush=True)
+            result = (folder, error)
+            finished = True
+        except Exception as error:
+            print(f"LOAD {folder} TABLE FAILED WITH \"{error}\"", flush=True)
+            result = (folder, error)
+            retryNumber+=1
+            time.sleep(30)
+    return result
+
+
+def read_from_sql(server, database, schema, table, token, incremental=False, last_modified=None, last_partition=None, start_date=None):
+    """Read table data from SQL Database using jdbc connection
+
+    Args:
+        server (String): the name of th server
+        database (String): the name of database
+        schema (String): the name of the schema
+        table (String): the name of the table
+        token (String): the generated token using linked service
+        incremental (Boolean): is the table is incremental load
+        last_modified (String): The name of the column for the watermark
+        last_partition (String): The latest partition date
+        start_date (String): The start date for the init
+        
+    Returns:
+        dataframe: the table data load into a dataframe
+    """
+
+    jdbcUrl = f"jdbc:sqlserver://{server}:1433;databaseName={database};encrypt=true;trustServerCertificate=false;hostNameInCertificate=*.database.windows.net;loginTimeout=30"
+    connectionProperties = {
+        "driver" : "com.microsoft.sqlserver.jdbc.SQLServerDriver",
+        "accessToken" : token
+    }
+
+    print(f"incremental={incremental}")
+    print(f"last_partition={last_partition}")
+    print(f"start_date={start_date}")
+
+    if(incremental==True):
+        if(last_partition != None):
+            if(start_date != None):
+                pushdown_query = f"(SELECT * FROM [{schema}].[{table}] where ({last_modified} >= '{last_partition}') and ({last_modified} >= '{start_date}')) as tb1"
+            else:
+                pushdown_query = f"(SELECT * FROM [{schema}].[{table}] where {last_modified} >= '{last_partition}') as tb1"
+        else:
+            if(start_date != None):
+                pushdown_query = f"(SELECT * FROM [{schema}].[{table}] where {last_modified} >= '{start_date}') as tb1"
+            else:
+                pushdown_query= f"(SELECT * FROM [{schema}].[{table}]) as tb1"
+    else:
+        pushdown_query= f"(SELECT * FROM [{schema}].[{table}]) as tb1"
+    
+    print(pushdown_query)
+    df = spark.read \
+    .option("fetchsize", 10000) \
+    .option("numPartitions", 5) \
+    .jdbc(url=jdbcUrl, table=pushdown_query, properties=connectionProperties)
+    return df
+
+
+def convert_string_to_json(json_string_formatted):
+    formatted_string=json_string_formatted.replace("true","True")
+    formatted_string=formatted_string.replace("false","False")
+    formatted_string=formatted_string.replace("null","None")
+    formatted_string=ast.literal_eval(formatted_string)
+    return formatted_string
+
+# Get list tables from catalog
+catalog_tables=convert_string_to_json(catalog_tables)
+print(catalog_tables)
+
+# Create an empty list
+servers=[]
+source_database_names=[]
+destination_paths=[]
+destination_zones=[]
+schema_names = []
+table_names = []
+is_incremental_loads = []
+last_modified_columns = []
+start_dates = []
+child_notebook_paths = []
+time_outs = []
+retry_numbers = []
+source_link_names = []
+
+# create list of parameters
+for row in catalog_tables:
+    servers.append(server)
+    source_database_names.append(source_database_name)
+    destination_paths.append(destination_path)
+    destination_zones.append(destination_zone)
+    schema_names.append(row["schema_name"])
+    table_names.append(row["table_name"])
+    is_incremental_loads.append(row["is_incremental_load"])
+    last_modified_columns.append(row["last_modified_column"])
+    start_dates.append(row["start_date"])
+    child_notebook_paths.append(child_notebook_path)
+    time_outs.append(time_out)
+    retry_numbers.append(retry_number)
+    source_link_names.append(source_link_name)
+
+print(f"table_names={table_names}")
+
+with ThreadPoolExecutor(thread_pool_executor) as executor:
+    results = list(
+        executor.map(
+            raw_to_cleansed,
+            servers,
+            source_database_names,
+            destination_paths, 
+            destination_zones,
+            schema_names,
+            table_names,
+            is_incremental_loads,
+            last_modified_columns,
+            start_dates,
+            child_notebook_paths,
+            time_outs,
+            retry_numbers,
+            source_link_names
+        )
+    )
+    print(f"results={results}")
+
+mssparkutils.notebook.exit(json.dumps({
+    'success': [table for table, error in results if error is None],
+    'failure': [table for table, error in results if error is not None],
+    'errors': {table: str(error) for table, error in results if error is not None}
+}))
