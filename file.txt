@@ -1,7 +1,313 @@
-After investigation, it was found that the column NUM_ProjectKey in the table [DAL_EPV2_BI].[ETB].[DWH_TB_FactProgress] contains NULL values (refer to screenshot DalEPV2BI_FactProgress).
-Reviewing the offload spot spot_epv2_bi in the dedicated environment revealed that the source table [spot_epv2_bi].[dbo].[dwh_tb_factprogress], which feeds data into the DAL_EPV2_BI database, has the NUM_ProjectKey column correctly populated with valid integer values (see screenshot SpotEPV2BI_FactProgress).
-However, it was also observed that within the spot_epv2_bi, the NUM_ProjectKey column is defined as a computed column (see screenshot Spot_EPV2_BI_FactProgress_DataType), along with the columns NUM_CutOffKey and Partion_Date. These computed columns result in NULL values in the DAL_EPV2_BI database.
-This behavior is explained by the fact that these columns serve as partition keys used for incremental offloads rather than full loads. The attached screenshot Tables_With_Inc_Load lists tables configured for incremental offloading along with their respective partition keys, which exhibit the same issue. In contrast, tables using full load mode, such as [DAL_EPV2_BI].[ETB].[DWH_TB_FactPreservationFuture], show valid values in the NUM_ProjectKey column instead of NULLs (see screenshot Table_With_Full_Load).
-Further examination shows that all tables using incremental offloads have partition keys defined as computed columns in the spot_epv2_bi. Consequently, these keys are not physically stored in the data and appear as NULL in the DAL_EPV2_BI database (see screenshot Example_FactCertification.png for the table TB_FactCertification as an example).
-This case is not considered an incident, as it has not been working correctly from the start after deployment, and all affected tables share this issue. It is recommended to raise a production bug or create a user story to address this problem for all impacted tables, not only TB_FactProgress.
-Regards,
+CREATE PROCEDURE [STG].[SP_FactCertification]
+	@CertificationLoadType [VARCHAR](8000),
+	@JobId INT
+AS
+
+-- ===========================================================================================================================================
+-- Author :				Simon THULEAU
+-- Creation :			2022-04-21
+-- Description :		Staging procedure of table TB_FactCertification that compute the source data and upsert target with CTAS statement
+
+-- Update(s) :
+-- 01 Dimendra Sahu 2024-01-19 : Modified script to process hostory as well as current cut off data for all the projects based on parameter
+--								  provided while invoking the script
+-- ===========================================================================================================================================
+
+SET NOCOUNT ON
+
+-- ===========================================================================================================================================
+-- 0) Cleaning calculation table(s) created in the process
+-- ===========================================================================================================================================
+
+EXECUTE [ADM].[SP_DropTableIfExists]
+	@TableName = N'STG.TB_StgCertification'
+;
+
+-- ===========================================================================================================================================
+-- 1) Calculation of source table from landing objects
+-- ===========================================================================================================================================
+
+BEGIN TRY
+	CREATE TABLE
+		[STG].[TB_StgCertification]
+	WITH (
+		DISTRIBUTION = ROUND_ROBIN
+		,CLUSTERED COLUMNSTORE INDEX
+	)
+	AS
+	WITH _StepType_ AS (
+		SELECT
+			[NUM_CertificationKey] = prg.NUM_ProgressKey
+			,prg.[NUM_ProjectKey]
+			,prg.[NUM_WorkStepKey]
+			,prg.[NUM_TagKey]
+			,prg.[NUM_CutOffKey]
+			,prg.[NUM_ContractKey]
+			,prg.[NUM_SubWorkClassKey]
+			,prg.[ID_DimProject]
+			,wst.[ID_DimSubWorkClass]
+			,prg.[ID_DimWorkStep]
+			,prg.[ID_DimTag]
+			,prg.[ID_DimCutOff]
+			,prg.[ID_DimContract]
+			,ins.[ID_DimInspection]
+
+			,prg.[NUM_Progress]
+			,prg.[NUM_ReshapedProgress]
+			,prg.[NUM_ReshapedWeight]
+			,prg.[BLN_IsNotRequired]
+			,prg.[BLN_IsNotApplicable]
+			-- only position of active steps is considered to identify reached of missed steps
+			,[NUM_Position] = CASE WHEN prg.NUM_RecordStatus = 0 OR wst.NUM_RecordStatus = 0 THEN wst.NUM_Position END
+			-- State Order : #1 = RFI can be created, #2 = RFI Issued/to be inspected, #3 = To be signed by Owner, #4 = Documentation Required, #5 = Inspection Completed
+			,[NUM_StateOrder] = stt.NUM_StateCode
+			-- steps with at least 99% progress or unweighted but with RFI issued are considered certifiable
+			,[NUM_CertifiableStateOrder] = CASE WHEN prg.NUM_Progress >= 0.99 OR wst.BLN_IsPhysical = 0 AND stt.NUM_StateCode > 1 THEN 5 ELSE stt.NUM_StateCode END
+			-- a quality step marked as NA or NR is no longer considered as a certifying gate
+			,[BLN_IsGate] = CAST(CASE
+				WHEN wst.BLN_IsQuality = 1 AND (prg.BLN_IsNotRequired = 0 AND prg.BLN_IsNotApplicable = 0) THEN 1
+				ELSE 0
+				END AS BIT)
+			,prg.[NUM_RecordStatus]
+			,prg.[DTM_LastModifiedAt]
+			,prg.[ETL_DTM_CreatedAt] 
+			,prg.[TXT_Origin]
+		FROM
+			[DWH].[TB_FactProgress] AS prg
+		LEFT JOIN
+			[DWH].[TB_DimCutOff] AS cut
+			ON	cut.ID_DimCutOff = prg.ID_DimCutOff
+		INNER JOIN
+			[DWH].[TB_DimWorkStep] AS wst
+			ON	wst.ID_DimWorkStep = prg.ID_DimWorkStep
+		LEFT JOIN
+			[DWH].[TB_FactInspectionStatus] AS ins
+			ON	ins.ID_DimWorkStep = prg.ID_DimWorkStep
+			AND	ins.ID_DimTag = prg.ID_DimTag
+			AND 
+				ins.DTM_SourceRecordValidityStart <				
+				CASE
+					WHEN cut.BLN_IsCurrent = 1 THEN COALESCE(cut.DTM_ActualCutOffDate, GETDATE())
+					ELSE COALESCE(cut.DTM_ActualCutOffDate, cut.DTM_CutOffDate)
+				END
+			AND 
+				CASE
+					WHEN cut.BLN_IsCurrent = 1 THEN COALESCE(cut.DTM_ActualCutOffDate, GETDATE())
+					ELSE COALESCE(cut.DTM_ActualCutOffDate, cut.DTM_CutOffDate)
+				END
+				<= ins.DTM_SourceRecordValidityEnd
+			AND	ins.NUM_RecordStatus = 0
+		LEFT JOIN
+			[DWH].[TB_DimStatus] AS stt
+			ON	stt.ID_DimStatus = ins.ID_DimStatus
+		WHERE 
+			CASE 
+				WHEN @CertificationLoadType = 'ProcessHistoryCutoffData' THEN 1
+				WHEN @CertificationLoadType = 'ProcessCurrentCutoffData' THEN CASE WHEN cut.BLN_IsCurrent = 1 OR cut.BLN_IsPrevious = 1 THEN 1 END
+				ELSE 0
+			END = 1
+	)
+	,_StepStatus_ AS (
+		SELECT
+		*
+		,[NUM_LastPOCCertifiedStepReached] = MAX(CASE WHEN BLN_IsGate = 1 AND NUM_StateOrder >= 5 THEN NUM_Position END) OVER (PARTITION BY ID_DimProject, ID_DimCutOff, ID_DimSubWorkClass, ID_DimTag)
+		,[NUM_LastROCCertifiedStepReached] = MAX(CASE WHEN BLN_IsGate = 1 AND NUM_StateOrder >= 4 THEN NUM_Position END) OVER (PARTITION BY ID_DimProject, ID_DimCutOff, ID_DimSubWorkClass, ID_DimTag)
+		,[NUM_LastPOCCertifiableStepReached] = MAX(CASE WHEN BLN_IsGate = 1 AND NUM_CertifiableStateOrder >= 5 THEN NUM_Position END) OVER (PARTITION BY ID_DimProject, ID_DimCutOff, ID_DimSubWorkClass, ID_DimTag)
+		,[NUM_LastROCCertifiableStepReached] = MAX(CASE WHEN BLN_IsGate = 1 AND NUM_CertifiableStateOrder >= 4 THEN NUM_Position END) OVER (PARTITION BY ID_DimProject, ID_DimCutOff, ID_DimSubWorkClass, ID_DimTag)
+		,[NUM_FirstPOCCertifiedStepMissed] = MIN(CASE WHEN BLN_IsGate = 1 AND NUM_StateOrder < 5 THEN NUM_Position END) OVER (PARTITION BY ID_DimProject, ID_DimCutOff, ID_DimSubWorkClass, ID_DimTag)
+		,[NUM_FirstROCCertifiedStepMissed] = MIN(CASE WHEN BLN_IsGate = 1 AND NUM_StateOrder < 4 THEN NUM_Position END) OVER (PARTITION BY ID_DimProject, ID_DimCutOff, ID_DimSubWorkClass, ID_DimTag)
+		,[NUM_FirstPOCCertifiableStepMissed] = MIN(CASE WHEN BLN_IsGate = 1 AND NUM_CertifiableStateOrder < 5 THEN NUM_Position END) OVER (PARTITION BY ID_DimProject, ID_DimCutOff, ID_DimSubWorkClass, ID_DimTag)
+		,[NUM_FirstROCCertifiableStepMissed] = MIN(CASE WHEN BLN_IsGate = 1 AND NUM_CertifiableStateOrder < 4 THEN NUM_Position END) OVER (PARTITION BY ID_DimProject, ID_DimCutOff, ID_DimSubWorkClass, ID_DimTag)
+	FROM
+		_StepType_
+	)
+
+	SELECT
+		 [NUM_CertificationKey]
+		,[NUM_ProjectKey]
+		,[NUM_WorkStepKey]
+		,[NUM_TagKey]
+		,[NUM_CutOffKey]
+		,[NUM_ContractKey]
+		,[NUM_SubWorkClassKey]
+		,[ID_DimProject]
+		,[ID_DimWorkStep]
+		,[ID_DimTag]
+		,[ID_DimCutOff]
+		,[ID_DimContract]
+		,[ID_DimInspection]
+		,[NUM_Progress]
+		,[NUM_ReshapedProgress]
+		,[NUM_ReshapedWeight]
+		,[BLN_IsNotRequired]
+		,[BLN_IsNotApplicable]
+		,[BLN_IsFirstPOCCertifiedStepMissed] = CAST(CASE NUM_Position WHEN NUM_FirstPOCCertifiedStepMissed THEN 1 ELSE 0 END AS BIT)
+		,[BLN_IsFirstROCCertifiedStepMissed] = CAST(CASE NUM_Position WHEN NUM_FirstROCCertifiedStepMissed THEN 1 ELSE 0 END AS BIT)
+		,[BLN_IsLastPOCCertifiedStepReached] = CAST(CASE NUM_Position WHEN NUM_LastPOCCertifiedStepReached THEN 1 ELSE 0 END AS BIT)
+		,[BLN_IsLastROCCertifiedStepReached] = CAST(CASE NUM_Position WHEN NUM_LastROCCertifiedStepReached THEN 1 ELSE 0 END AS BIT)
+		-- only active steps could be certified
+		,[BLN_IsPOCCertified] = CAST(CASE WHEN NUM_RecordStatus = 0 AND (NUM_FirstPOCCertifiedStepMissed IS NULL OR NUM_Position <= NUM_LastPOCCertifiedStepReached) AND (BLN_IsGate = 0 OR NUM_StateOrder = 5) THEN 1 ELSE 0 END AS BIT)
+		,[BLN_IsROCCertified] = CAST(CASE WHEN NUM_RecordStatus = 0 AND NUM_Position < COALESCE(NUM_FirstROCCertifiedStepMissed, NUM_Position + 1) AND (BLN_IsGate = 1 OR BLN_IsGate = 0 AND NUM_Progress = 1) THEN 1 ELSE 0 END AS BIT)
+		,[BLN_IsFirstPOCCertifiableStepMissed] = CAST(CASE NUM_Position WHEN NUM_FirstPOCCertifiableStepMissed THEN 1 ELSE 0 END AS BIT)
+		,[BLN_IsFirstROCCertifiableStepMissed] = CAST(CASE NUM_Position WHEN NUM_FirstROCCertifiableStepMissed THEN 1 ELSE 0 END AS BIT)
+		,[BLN_IsLastPOCCertifiableStepReached] = CAST(CASE NUM_Position WHEN NUM_LastPOCCertifiableStepReached THEN 1 ELSE 0 END AS BIT)
+		,[BLN_IsLastROCCertifiableStepReached] = CAST(CASE NUM_Position WHEN NUM_LastROCCertifiableStepReached THEN 1 ELSE 0 END AS BIT)
+		-- only active steps could be certifiable
+		,[BLN_IsPOCCertifiable] = CAST(CASE WHEN NUM_RecordStatus = 0 AND (NUM_FirstPOCCertifiableStepMissed IS NULL OR NUM_Position <= NUM_LastPOCCertifiableStepReached) AND (BLN_IsGate = 0 OR NUM_CertifiableStateOrder = 5) THEN 1 ELSE 0 END AS BIT)
+		,[BLN_IsROCCertifiable] = CAST(CASE WHEN NUM_RecordStatus = 0 AND NUM_Position < COALESCE(NUM_FirstROCCertifiableStepMissed, NUM_Position + 1) AND (BLN_IsGate = 1 OR BLN_IsGate = 0 AND NUM_Progress = 1) THEN 1 ELSE 0 END AS BIT)
+		,[NUM_RecordStatus]
+		,[DTM_LastModifiedAt]
+		,[ETL_DTM_CreatedAt] 
+		,[TXT_Origin]
+	FROM
+		_StepStatus_
+	;
+
+	-- Test of business key unicity, in case of duplicates : reject both rows and delete them from the table on which the Data Quality rule is applied
+	IF EXISTS (SELECT TOP 1 1 FROM [STG].[TB_StgCertification] GROUP BY NUM_ProjectKey, NUM_CertificationKey, NUM_CutOffKey HAVING COUNT(*) > 1)
+	BEGIN
+		EXEC [ADM].[SP_DeleteAndLogDuplicatedRecords]
+			@JobMonitoringId = @JobId, 
+			@SchemaName = N'STG', 
+			@TableName = N'TB_StgCertification', 
+			@StoredProcedure = N'SP_FactCertification', 
+			@Layer = N'Staging', 
+			@KeyColumns = N'NUM_ProjectKey, NUM_CertificationKey, NUM_CutOffKey', 
+			@RejectionCause = N'Violation of the business key unicity' 
+		;
+	END
+
+-- ===========================================================================================================================================
+-- 2) Provision of DWH table with DML operations
+-- ===========================================================================================================================================
+
+	IF (@CertificationLoadType = 'ProcessCurrentCutoffData')
+		DELETE t
+		FROM
+			[DWH].[TB_FactCertification] AS t
+		LEFT JOIN
+			[STG].[VW_ProgressWorkStepHistory_DeleteLog]  AS d
+			ON	d.ProjectId = t.NUM_ProjectKey
+			AND	d.WsFollowUpId = t.NUM_CertificationKey
+			AND d.Origin = t.TXT_Origin
+		LEFT JOIN
+			[STG].[TB_StgCertification] AS s
+			ON	s.NUM_ProjectKey = t.NUM_ProjectKey
+			AND	s.NUM_TagKey = t.NUM_TagKey
+			AND	s.NUM_WorkStepKey = t.NUM_WorkStepKey
+			AND	s.NUM_SubWorkClassKey = t.NUM_SubWorkClassKey 
+			AND s.NUM_CutOffKey = t.NUM_CutOffKey
+		WHERE 
+			d.ProjectId IS NOT NULL
+			OR s.NUM_ProjectKey IS NOT NULL
+	;
+	ELSE
+		DELETE FROM [DWH].[TB_FactCertification] WHERE 1 = 1
+	;
+	
+	INSERT INTO [DWH].[TB_FactCertification] (
+		 [NUM_CertificationKey]
+		,[NUM_ProjectKey]
+		,[NUM_WorkStepKey]
+		,[NUM_TagKey]
+		,[NUM_CutOffKey]
+		,[NUM_ContractKey]
+		,[NUM_SubWorkClassKey]
+		,[ID_DimProject]
+		,[ID_DimWorkStep]
+		,[ID_DimTag]
+		,[ID_DimCutOff]
+		,[ID_DimContract]
+		,[ID_DimInspection]
+		,[NUM_Progress]
+		,[NUM_ReshapedProgress]
+		,[NUM_ReshapedWeight]
+		,[BLN_IsNotRequired]
+		,[BLN_IsNotApplicable]
+		,[BLN_IsFirstPOCCertifiedStepMissed]
+		,[BLN_IsFirstROCCertifiedStepMissed]
+		,[BLN_IsLastPOCCertifiedStepReached]
+		,[BLN_IsLastROCCertifiedStepReached]
+		,[BLN_IsPOCCertified]
+		,[BLN_IsROCCertified]
+		,[BLN_IsFirstPOCCertifiableStepMissed]
+		,[BLN_IsFirstROCCertifiableStepMissed]
+		,[BLN_IsLastPOCCertifiableStepReached]
+		,[BLN_IsLastROCCertifiableStepReached]
+		,[BLN_IsPOCCertifiable]
+		,[BLN_IsROCCertifiable]
+		,[NUM_RecordStatus]
+		,[DTM_LastModifiedAt]
+		,[ETL_DTM_CreatedAt] 
+		,[TXT_Origin]
+	)
+	SELECT
+		 s.[NUM_CertificationKey]
+		,s.[NUM_ProjectKey]
+		,s.[NUM_WorkStepKey]
+		,s.[NUM_TagKey]
+		,s.[NUM_CutOffKey]
+		,s.[NUM_ContractKey]
+		,s.[NUM_SubWorkClassKey]
+		,s.[ID_DimProject]
+		,s.[ID_DimWorkStep]
+		,s.[ID_DimTag]
+		,s.[ID_DimCutOff]
+		,s.[ID_DimContract]
+		,s.[ID_DimInspection]
+		,s.[NUM_Progress]
+		,s.[NUM_ReshapedProgress]
+		,s.[NUM_ReshapedWeight]
+		,s.[BLN_IsNotRequired]
+		,s.[BLN_IsNotApplicable]
+		,s.[BLN_IsFirstPOCCertifiedStepMissed]
+		,s.[BLN_IsFirstROCCertifiedStepMissed]
+		,s.[BLN_IsLastPOCCertifiedStepReached]
+		,s.[BLN_IsLastROCCertifiedStepReached]
+		,s.[BLN_IsPOCCertified]
+		,s.[BLN_IsROCCertified]
+		,s.[BLN_IsFirstPOCCertifiableStepMissed]
+		,s.[BLN_IsFirstROCCertifiableStepMissed]
+		,s.[BLN_IsLastPOCCertifiableStepReached]
+		,s.[BLN_IsLastROCCertifiableStepReached]
+		,s.[BLN_IsPOCCertifiable]
+		,s.[BLN_IsROCCertifiable]
+		,s.[NUM_RecordStatus]
+		,s.[DTM_LastModifiedAt]
+		,s.[ETL_DTM_CreatedAt] 
+		,s.[TXT_Origin]
+	FROM
+		[DWH].[TB_FactCertification] AS t
+	RIGHT JOIN
+		[STG].[TB_StgCertification] AS s
+		ON	s.NUM_ProjectKey = t.NUM_ProjectKey
+		AND	s.NUM_TagKey = t.NUM_TagKey
+		AND	s.NUM_WorkStepKey = t.NUM_WorkStepKey
+		AND	s.NUM_SubWorkClassKey = t.NUM_SubWorkClassKey 
+		AND s.NUM_CutOffKey = t.NUM_CutOffKey
+	WHERE
+		t.NUM_ProjectKey IS NULL
+	;
+
+END TRY
+
+-- ===========================================================================================================================================
+-- 3) Catch of informations about error that may occur during the MERGE
+-- ===========================================================================================================================================
+
+BEGIN CATCH
+	-- star selection is intentionnal in order to automatically get the view modifications with no need to update all Feed procedures
+	SELECT * FROM [ADM].[VW_SqlError]
+	;
+
+	THROW;
+END CATCH
+
+-- ===========================================================================================================================================
+-- 4) Cleaning calculation table(s) created in the process
+-- ===========================================================================================================================================
+
+EXECUTE [ADM].[SP_DropTableIfExists]
+	@TableName = N'STG.TB_StgCertification'
+;
+GO
